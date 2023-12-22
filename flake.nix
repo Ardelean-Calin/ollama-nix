@@ -5,150 +5,164 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   };
 
-  outputs = { self, nixpkgs }:
-    let
-      system = "x86_64-linux";
-      pkgs = import nixpkgs {
-        inherit system;
-        config.allowUnfree = true;
-      };
-    in
-    {
-      formatter.${system} = pkgs.nixpkgs-fmt;
+  outputs = {
+    self,
+    nixpkgs,
+  }: let
+    system = "x86_64-linux";
+    pkgs = import nixpkgs {
+      inherit system;
+      config.allowUnfree = true;
+    };
+  in {
+    formatter.${system} = pkgs.nixpkgs-fmt;
 
-      overlays.default = final: prev: {
-        ollama = self.packages.${system}.default;
-      };
+    overlays.default = final: prev: {
+      ollama = self.packages.${system}.default;
+    };
 
-      packages.${system} = rec {
-        llama-cpp = pkgs.llama-cpp.overrideAttrs (old: {
-          buildInputs = old.buildInputs ++ (
-            with pkgs.cudaPackages; [ libcublas cudatoolkit ]
+    packages.${system} = rec {
+      llama-cpp = pkgs.llama-cpp.overrideAttrs (old: {
+        buildInputs =
+          old.buildInputs
+          ++ (
+            with pkgs.cudaPackages; [libcublas cudatoolkit]
           );
-          cmakeFlags = [
-            "-DLLAMA_BUILD_SERVER=ON"
-            "-DBUILD_SHARED_LIBS=ON"
-            "-DLLAMA_CUBLAS=ON"
-            "-DCMAKE_SKIP_BUILD_RPATH=ON"
+        cmakeFlags = [
+          "-DLLAMA_BUILD_SERVER=ON"
+          "-DBUILD_SHARED_LIBS=ON"
+          "-DLLAMA_CUBLAS=ON"
+          "-DCMAKE_SKIP_BUILD_RPATH=ON"
+        ];
+
+        # By default, llama-cpp package does not have a lib/ output. Ollama
+        # requires libllama and others, so the install phase was modified to
+        # copy all of built shared libraries to the $out/lib/.
+        installPhase = ''
+          runHook preInstall
+
+          mkdir -p $out/bin
+
+          # Ollama requires libllama and others
+          mkdir -p $out/lib
+          find . -type f -name "*.so" -exec cp {} $out/lib \;
+
+          for f in bin/*; do
+            test -x "$f" || continue
+            cp "$f" $out/bin/llama-cpp-"$(basename "$f")"
+          done
+
+          runHook postInstall
+        '';
+      });
+
+      ollama = let
+        llama-cpp = self.packages.${system}.llama-cpp;
+      in
+        pkgs.buildGoModule rec {
+          inherit (pkgs.ollama) pname meta;
+
+          version = "0.1.17";
+
+          src = pkgs.fetchFromGitHub {
+            owner = "jmorganca";
+            repo = "ollama";
+            rev = "v${version}";
+            hash = "sha256-eXukNn9Lu1hF19GEi7S7a96qktsjnmXCUp38gw+3MzY=";
+          };
+
+          patches = [
+            # disable passing the deprecated gqa flag to llama-cpp-server
+            # see https://github.com/ggerganov/llama.cpp/issues/2975
+            ./disable-gqa.patch
+
+            # replace the call to the bundled llama-cpp-server with the one in the llama-cpp package
+            ./set-llamacpp-path.patch
           ];
 
-          # By default, llama-cpp package does not have a lib/ output. Ollama
-          # requires libllama and others, so the install phase was modified to
-          # copy all of built shared libraries to the $out/lib/.
-          installPhase = ''
-            runHook preInstall
-
-            mkdir -p $out/bin
-
-            # Ollama requires libllama and others
-            mkdir -p $out/lib
-            find . -type f -name "*.so" -exec cp {} $out/lib \;
-
-            for f in bin/*; do
-              test -x "$f" || continue
-              cp "$f" $out/bin/llama-cpp-"$(basename "$f")"
-            done
-
-            runHook postInstall
+          postPatch = ''
+            substituteInPlace llm/llama.go \
+              --subst-var-by llamaCppServer "${llama-cpp}/bin/llama-cpp-server"
+            substituteInPlace server/routes_test.go --replace "0.0.0" "${version}"
           '';
-        });
 
-        ollama =
-          let
-            llama-cpp = self.packages.${system}.llama-cpp;
-          in
-          pkgs.buildGoModule rec {
-            inherit (pkgs.ollama) pname meta patches;
+          # Inheriting ldflags from pkgs.ollama will inherit the old version setting.
+          ldflags = [
+            "-s"
+            "-w"
+            "-X=github.com/jmorganca/ollama/version.Version=${version}"
+            "-X=github.com/jmorganca/ollama/server.mode=release"
+          ];
 
-            version = "0.1.10";
+          vendorHash = "sha256-yGdCsTJtvdwHw21v0Ot6I8gxtccAvNzZyRu1T0vaius=";
+        };
 
-            src = pkgs.fetchFromGitHub {
-              owner = "jmorganca";
-              repo = "ollama";
-              rev = "v${version}";
-              hash = "sha256-1MoRoKN8/oPGW5TL40vh9h0PMEbAuG5YmuNHPvNtHgA=";
-            };
+      default = ollama;
+    };
 
-            postPatch = ''
-              substituteInPlace llm/llama.go \
-                --subst-var-by llamaCppServer "${llama-cpp}/bin/llama-cpp-server"
-            '';
+    nixosModules.default = {
+      config,
+      lib,
+      ...
+    }: let
+      ollamaPackage = self.packages.${system}.ollama;
+    in
+      with lib; {
+        options = {
+          services.ollama.enable = mkEnableOption "Enable Ollama LLM runner service";
+        };
+        config = mkIf config.services.ollama.enable {
+          assertions = [
+            {
+              assertion = config.nixpkgs.system == system;
+              message = "Only ${system} is supported by this flake.";
+            }
+            {
+              assertion = config.boot.kernelPackages ? nvidia_x11;
+              message = "Nvidia driver has to be present.";
+            }
+          ];
 
-            # Inheriting ldflags from pkgs.ollama will inherit the old version setting.
-            ldflags = [
-              "-s"
-              "-w"
-              "-X=github.com/jmorganca/ollama/version.Version=${version}"
-              "-X=github.com/jmorganca/ollama/server.mode=release"
-            ];
+          # Add the ollama system user for the system-wide service.
+          users.users.ollama = {
+            isSystemUser = true;
+            group = "ollama";
 
-            vendorHash = "sha256-9Ml5YvK5grSOp/A8AGiWqVE1agKP13uWIZP9xG2gf2o=";
+            # All the requested LLM weights are stored in this directory.
+            createHome = true;
+            home = "/var/lib/ollama";
           };
+          users.groups.ollama = {};
 
-        default = ollama;
-      };
+          # Make ollama package available system-wide.
+          environment.systemPackages = [ollamaPackage];
 
-      nixosModules.default = { config, lib, ... }:
-        let
-          ollamaPackage = self.packages.${system}.ollama;
-        in
-        with lib; {
-          options = {
-            services.ollama.enable = mkEnableOption "Enable Ollama LLM runner service";
-          };
-          config = mkIf config.services.ollama.enable {
-            assertions = [
-              {
-                assertion = config.nixpkgs.system == system;
-                message = "Only ${system} is supported by this flake.";
-              }
-              {
-                assertion = config.boot.kernelPackages ? nvidia_x11;
-                message = "Nvidia driver has to be present.";
-              }
-            ];
+          # Ollama server listens on http://127.0.0.1:49977, every user with network
+          # access is able to access it and use to run chosen LLM. It does not make
+          # sense to have a separate `ollama serve` instance for every user (there is
+          # no data shared, only weights of the LLM), so it is reasonable to run it as
+          # a system-wide service.
+          systemd.services.ollama = {
+            description = "Service for running LLMs";
 
-            # Add the ollama system user for the system-wide service.
-            users.users.ollama = {
-              isSystemUser = true;
-              group = "ollama";
+            wantedBy = ["multi-user.target"];
+            after = ["network.target"];
 
-              # All the requested LLM weights are stored in this directory.
-              createHome = true;
-              home = "/var/lib/ollama";
-            };
-            users.groups.ollama = { };
+            path = [config.boot.kernelPackages.nvidia_x11.bin];
 
-            # Make ollama package available system-wide.
-            environment.systemPackages = [ ollamaPackage ];
+            serviceConfig = {
+              Type = "simple";
 
-            # Ollama server listens on http://127.0.0.1:49977, every user with network
-            # access is able to access it and use to run chosen LLM. It does not make
-            # sense to have a separate `ollama serve` instance for every user (there is
-            # no data shared, only weights of the LLM), so it is reasonable to run it as
-            # a system-wide service.
-            systemd.services.ollama = {
-              description = "Service for running LLMs";
+              User = "ollama";
+              Group = "ollama";
 
-              wantedBy = [ "multi-user.target" ];
-              after = [ "network.target" ];
+              ExecStart = "${ollamaPackage}/bin/ollama serve";
 
-              path = [ config.boot.kernelPackages.nvidia_x11.bin ];
-
-              serviceConfig = {
-                Type = "simple";
-
-                User = "ollama";
-                Group = "ollama";
-
-                ExecStart = "${ollamaPackage}/bin/ollama serve";
-
-                Restart = "always";
-                RestartSec = 3;
-              };
+              Restart = "always";
+              RestartSec = 3;
             };
           };
         };
-
-    };
+      };
+  };
 }
